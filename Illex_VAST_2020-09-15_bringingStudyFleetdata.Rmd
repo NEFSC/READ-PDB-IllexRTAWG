@@ -667,37 +667,11 @@ vorclip_att$Probability2 <- cut(vorclip_att$Probability
                                                     , "At least 40%", "At least 60%"
                                                     , "Atleast 80%")
                                        )
-##### make the plot for one year ##### 
-# probpanelone_cat <- ggplot() +
-#     geom_sf(data = vorclip_att[which(vorclip_att$Year== 2000),,] %>% st_transform(crs="+proj=longlat +datum=WGS84"), aes(fill = Probability2), color = NA, lwd = 0) +
-#     scale_fill_brewer(palette = "Purples") +
-#     geom_polygon(data = reg, aes(x=long, y = lat, group = group),fill = 'black') +
-#     ggtitle(Year_Set[1]) +
-#     geom_sf(data = effortdat[[1]], aes(color="red"), alpha = 0) +
-#     guides(color = FALSE) +
-#     coord_sf(xlim = c(-77.5,-65.5), ylim = c(33.5,44.5)) +
-#     theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5))
-# probpanelone_cat
-
 ##### Make a list object of probability maps with effort overlaid. ##### 
-prmaps <- list()
 prmapscat <- list()
 
 for (i in 1:length(Year_Set)){
  
-  # #plot with probability gradient
-  # probpanel <- ggplot() +
-  #   geom_sf(data = vorclip_att[which(vorclip_att$Year== Year_Set[i]),,]  %>%
-  #             st_transform(crs="+proj=longlat +datum=WGS84"), aes(fill = Probability), color = NA, lwd = 0) +
-  #   scale_fill_viridis_c() +
-  #   geom_polygon(data = reg, aes(x=long, y = lat, group = group),fill = 'black') +
-  #   ggtitle(Year_Set[i]) +
-  #   geom_sf(data = effortdat[[i]], aes(color="red"), alpha = 0) +
-  #   guides(color = FALSE) +
-  #   coord_sf(xlim = c(-77.5,-65.5), ylim = c(33.5,44.5)) +
-  #   theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5))
-  # prmaps[[i]] <- probpanel
-  
     probpanelcat <- ggplot() +
     geom_sf(data = vorclip_att[which(vorclip_att$Year== Year_Set[i]),,] %>% 
               st_transform(crs="+proj=longlat +datum=WGS84"), aes(fill = Probability2), color = NA, lwd = 0) +
@@ -733,34 +707,6 @@ themebottom <- theme(plot.title = element_text(hjust = 0.5)
                      , axis.text.y= element_blank()
                      , axis.title.y = element_blank()
                      , legend.position = "none")
-
-##### patchwork of probability gradient maps ######
-# probgradientpatch <-
-#   (prmaps[[1]] + ggtitle(Year_Set[1]) + themeleft) +
-#   (prmaps[[2]] + ggtitle(Year_Set[2]) + themeinner) +
-#   (prmaps[[3]] + ggtitle(Year_Set[3]) + themeinner) +
-#   (prmaps[[4]] + ggtitle(Year_Set[4]) + themeinner) +
-#   (prmaps[[5]] + ggtitle(Year_Set[5]) + themeinner) +
-#   (prmaps[[6]] + ggtitle(Year_Set[6]) + themeleft) +
-#   (prmaps[[7]] + ggtitle(Year_Set[7]) + themeinner) +
-#   (prmaps[[8]] + ggtitle(Year_Set[8]) + themeinner) +
-#   (prmaps[[9]] + ggtitle(Year_Set[9]) + themeinner) +
-#   (prmaps[[10]] + ggtitle(Year_Set[10]) + themeinner) +
-#   (prmaps[[11]] + ggtitle(Year_Set[11]) + themeleft) +
-#   (prmaps[[12]] + ggtitle(Year_Set[12]) + themeinner) +
-#   (prmaps[[13]] + ggtitle(Year_Set[13]) + themeinner) +
-#   (prmaps[[14]] + ggtitle(Year_Set[14]) + themeinner) +
-#   (prmaps[[15]] + ggtitle(Year_Set[15]) + themeinner) +
-#   (prmaps[[16]] + ggtitle(Year_Set[16]) + themecorner) +
-#   (prmaps[[17]] + ggtitle(Year_Set[17]) + themebottom) +
-#   (prmaps[[18]] + ggtitle(Year_Set[18]) + themebottom) +
-#   (prmaps[[19]] + ggtitle(Year_Set[19]) + themebottom) +
-#   # (prmaps[[20]] + ggtitle(Year_Set[20]) + themebottom) +
-#  plot_layout(ncol = 5, nrow = 4, guides = "collect")
-#  # plot_layout(ncol = 4, nrow = 5, guides = NULL)
-# 
-# ggsave(file = paste0(DateFile, "/probgradient_effort.jpg")
-#        , probgradientpatch, device = "jpeg", width = 10, height = 10, unit = "in")
 
 ##### patchwork of probability category maps ##### 
 
