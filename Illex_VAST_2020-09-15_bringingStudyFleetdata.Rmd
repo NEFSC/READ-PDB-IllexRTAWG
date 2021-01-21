@@ -1,0 +1,1114 @@
+---
+  title: "Illex Habitat Model Using VAST"
+author: "Brooke Wright"
+date: "September 2020"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+This version of the model includes data from the ____________ surveys and from Study Fleet haul records. The region is a user-defined extrapolation grid based on the NEFSC bottom trawl survey strata shapefile. Habitat covariates are included in the VAST model.
+  
+```{r, setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require("knitr")
+opts_knit$set(root.dir = "C:/Users/brooke.wright/Documents/BWRIGHT_NOAA/Illex/IllexData/FI_surveys") #set the working directory to the Illex project folder
+setwd("C:/Users/brooke.wright/Documents/BWRIGHT_NOAA/Illex/IllexData/FI_surveys")
+# opts_knit$set(root.dir = "~/ILLEX/IllexData/FI_surveys") #set the working directory to the Illex project folder
+# setwd("~/ILLEX/IllexData/FI_surveys")
+```
+
+```{r, create directory for model output}
+# DateFile = "C:/Users/brooke.wright/Documents/BWRIGHT_NOAA/Illex/IllexData/VAST_manuscript/msmod0b_surveys&sf_09-23/"
+DateFile = "C:/Users/brooke.wright/Documents/BWRIGHT_NOAA/Illex/IllexData/VAST_manuscript/msmod0bi_surveys&sf-agg_09-23/"
+ dir.create(DateFile)  #only have to create this directory the first time
+today <- lubridate::today()
+
+```
+
+```{r, load packages}
+library(TMB)
+library(VAST) 
+library(tidyverse)
+library(rgdal)
+library(rgeos)
+#library(ggvoronoi)
+library(sf)
+library(lwgeom)
+library(knitr)
+library(mapdata)
+library(patchwork)
+library(RColorBrewer)
+library(fishmethods)
+library(raster)
+
+```
+
+```{r, load and format the data}
+
+NWA_illex_data1 <- read.csv("NWA_day_2020_06_25.csv") #load the survey data
+NWA_illex_data2 <- read.csv("../ROMS/Illex_SF_ROMS_catch_update_2020-09-15.csv") #load the study fleet data with roms values
+catch <- read.csv("../FD_catch/SF_Illex_data_2020_08_25.csv", header = TRUE) #load original study fleet data
+
+names(NWA_illex_data1)
+names(NWA_illex_data2)
+
+##Do some formatting on the study fleet data
+NWA_illex_data2 <- catch %>% dplyr::select(VESSEL_NAME, EFFORT_ID) %>%
+  right_join(NWA_illex_data2, by = 'EFFORT_ID' ) %>%
+  mutate(Catch_KG = SUM_ISQ_CATCH*0.453592) %>%
+  dplyr::select(END_SET_LAT
+                , END_SET_LON
+                , YR
+                , END_SET_DATE_GMT
+                , AreaSwept_km2
+                , VESSEL_NAME
+                , DEPTH_M
+                , MEAN_TEMP_C
+                , Catch_KG
+                ) %>%
+    rename(Lat = END_SET_LAT
+           , Lon = END_SET_LON
+           , Year = YR
+           , DateTimeEST = END_SET_DATE_GMT
+           , Vessel = VESSEL_NAME
+           , Depth_M = DEPTH_M
+           , BottomTemp_C = MEAN_TEMP_C
+           ) %>%
+    mutate(Pres = ifelse(Catch_KG > 0, 1, 0))
+
+##Get zenith angles for study fleet data
+NWA_datetime <- cbind(day = as.numeric(substr(x = NWA_illex_data2$DateTimeEST, start = 9, stop = 10))
+                      , month = as.numeric(substr(x = NWA_illex_data2$DateTimeEST, start = 6, stop = 7))
+                      , hour = as.numeric(substr(x = NWA_illex_data2$DateTimeEST, start = 12, stop =13))
+                      , year = as.numeric(NWA_illex_data2$Year)
+                      , Lat = NWA_illex_data2$Lat
+                      , Lon = NWA_illex_data2$Lon
+                      )
+
+nwadata <- as.data.frame(NWA_datetime)  
+
+nwa_astro <- astrocalc4r(  day = nwadata$day
+                           , month = nwadata$month
+                           , year = nwadata$year
+                           , hour = nwadata$hour
+                           , timezone = rep(-5, times = nrow(nwadata))
+                           , lat = nwadata$Lat
+                           , lon = nwadata$Lon
+                           , withinput = FALSE
+                           , seaorland = "maritime"
+                           , acknowledgment = FALSE)
+
+NWA_illex_data2 <- cbind(NWA_illex_data2, 'zenith' = nwa_astro$zenith)
+NWA_illex_data2$Daytime <- ifelse(NWA_illex_data2$zenith <90, yes = 1, no = 0)
+
+
+##Make sure the datasets are consistent
+names(NWA_illex_data1) == names(NWA_illex_data2)  
+##Combine 'em
+NWA_illex_data <- rbind(NWA_illex_data1, NWA_illex_data2)
+##Clean up
+rm(catch, nwa_astro, nwadata, NWA_datetime)
+
+
+##A little more formatting on the combined data set
+nrow(NWA_illex_data)
+
+NWA_illex_data$CatchSource <- as.character(NWA_illex_data$Vessel) %>%
+  replace(list = which(NWA_illex_data$Vessel %in% unique(NWA_illex_data2$Vessel)), values = "StudyFleet") %>% 
+  as.factor()
+
+vesselyears<- group_by(NWA_illex_data, CatchSource, Vessel) %>% summarize(BeginYr = min(Year), EndYr = max(Year))
+View(vesselyears)
+catchsourceyears<- group_by(NWA_illex_data, CatchSource) %>% summarize(BeginYr = min(Year), EndYr = max(Year))
+kable(catchsourceyears)
+# write.csv(vesselyears, file = "C:/Users/brooke.wright/Documents/BWRIGHT_NOAA/Illex/IllexData/vessels_used.csv")
+
+NWA_illex_data <- NWA_illex_data %>%
+  mutate(Year = as.numeric(as.character(Year))
+         , Vessel = as.factor(Vessel)
+         ) %>%
+  filter(Daytime == 1) %>%
+  mutate(Vessel = droplevels(Vessel)) %>%
+  filter(Year <= 2018) %>% ##note trimmed final year(s) in SF and inshore surveys to be consistent with NMFS
+  filter(is.na(Lat) == FALSE, is.na(Lon) == FALSE, is.na(Year) == FALSE, AreaSwept_km2 > 0,) ###############!!!!!!!!!!!
+  # na.exclude()
+
+nrow(NWA_illex_data)
+
+## ! Note no haul times in MENH survey data pull
+## ! Note no depth and temperature in NEAMAP survey data pull
+## ... Try this first, and circle back to filling in missing temp data with ROMS... BLW 9/3/2020
+## Use only measured data for now because ROMS estimates do not match well with measurements. Work on this further after initial pub. BLW 9/14/2020
+
+## Follow Thorson's recommendation to jitter presence by very small amount so VAST will estimate a logistic regression model
+set.seed(908)
+for(i in 1:nrow(NWA_illex_data)){
+  NWA_illex_data$PresJitter[i] = ifelse(NWA_illex_data$Pres[i] == 0, 0, 1 + rnorm(n=1, mean=0, sd= 0.001)) 
+}
+
+# saveRDS(NWA_illex_data, file = "../VAST_manuscript/NWA_illex_data.rds")
+
+```
+
+## https://github.com/James-Thorson-NOAA/VAST
+
+Define spatial and model settings.
+```{r, spatial and model settings for VAST}
+Version = get_latest_version(package="VAST")
+
+#spatial settings
+Method = "Mesh" #specify the way values of random effects are assigned -- "Mesh" allows for anisotropy
+#grid_size_km = 25  #this was 25 in the example; smaller number leads to slower run time -- not used when Method = "Mesh"
+n_x = 500   # Specify the number of knots (i.e. sample locations) to use in defining spatial variables. Start with 50-100 while tinkering with the model (to speed up run time) and increase knots to increase spatial resolution of the predictions.
+Kmeans_Config = list("randomseed" = 1, "nstart" = 100, "iter.max" = 1e3 ) #
+
+#model settings
+# FieldConfig = c("Omega1"=1, "Epsilon1"=0, "Omega2"=0, "Epsilon2"=0) ##! temporarily turn off spatio-temporal factors to speed up initial run
+FieldConfig = c("Omega1"=1, "Epsilon1"=1, "Omega2"=0, "Epsilon2"=0) #number of spatial factors (Omegas) and spatio-temporal factors (Epsilons) for the probability (_1) and positive catch (_2) linear predictors
+
+RhoConfig = c("Beta1"=0, "Beta2"=3, "Epsilon1"=0, "Epsilon2"=0) #Specify temporal structure of intercepts and spatio-temporal variation. Beta1= Beta2= 0 is default and treats each intercept as a fixed effect. Epsilon1= Epsilon2= 0 is default and treats each vector of spatio-temporal random effects as independent among years. 
+#set beta2=3 to have a fixed effect constant among years for the positive catch component when using only encounter/non-encounter data
+
+OverdispersionConfig = c("Eta1"=1, "Eta2"=0) #Specify the number of catchability factors for each component. 0 turns off the random covariation in catchability. 1 gives one random effect for each unique [vessel] level.
+
+ObsModel = c("PosDist" = 2, "Link" = 0)  #specify distribution of positive catches (2=Gamma) and link functions (0=logit for probablility and log for positive catches)
+
+Options =  c("SD_site_density"=0,
+             "SD_site_logdensity"=0,
+             "Calculate_Range"=1,
+             "Calculate_evenness"=0,
+             "Calculate_effective_area"=1,
+             "Calculate_Cov_SE"=0,
+             'Calculate_Synchrony'=0,
+             'Calculate_Coherence'=0,
+             'normalize_GMRF_in_CPP'=TRUE)
+
+###### forumula for environmental covariates ######
+# formula = "" #Don't run this. Just remember to do a run with no environmental effects. Need to turn off several lines in make_data()
+# formula = "~ Depth_M"
+# formula = "~ BottomTemp_C"
+# formula = "~ Depth_M + Depth_M2 "
+# formula = "~ BottomTemp_C + BottomTemp_C2"
+# formula = "~ Depth_M + BottomTemp_C"
+# formula = "~ Depth_M + Depth_M2 + BottomTemp_C"
+# formula = "~ Depth_M + BottomTemp_C + BottomTemp_C2"
+# formula = "~ Depth_M + Depth_M2 + BottomTemp_C + BottomTemp_C2"
+
+####### stratification ######
+# For NEFSC indices, strata must be specified as a named list of area codes
+# strata.limits = list('STRATA' = "All_areas")
+Region = "User"
+
+```
+
+```{r, save the VAST settings for future use}
+Record = ThorsonUtilities::bundlelist(c("NWA_illex_data"
+                                        , "Version"
+                                        , "Method"
+                                        # , "grid_size_km"
+                                        , "n_x"
+                                        , "Kmeans_Config"
+                                        , "FieldConfig"
+                                        , "RhoConfig"
+                                        , "OverdispersionConfig" 
+                                        , "ObsModel"
+                                        , "Options"
+                                        , "formula"
+))
+save(Record, file=paste0(DateFile, "Record.RData"))
+capture.output(Record, file=paste0(DateFile, "Record.txt"))
+```
+
+```{r, make VAST extrapolation grid}
+# Extrapolation_List <- make_extrapolation_info(Region=Region, 
+#                                               strata.limits=as.data.frame(strata.limits), 
+#                                               observations_LL = NWA_illex_data[,c('Lat','Lon')], 
+#                                               maximum_distance_from_sample=15)
+
+# grid_NWA_BTS <- readRDS("grid_NWA_BTS_2020_09_14.rds")
+grid_NWA_BTS <- readRDS("grid_NWA_BTS_3x3nm.rds")
+
+NWA_BTS_boundaries <- c(range(grid_NWA_BTS$Lon), range(grid_NWA_BTS$Lat))
+NWA_BTS_stratalimits <- data.frame(
+  'STRATA' = c("All_areas")
+  , 'west_border' = c(NWA_BTS_boundaries[1])
+  , 'east_border' = c(NWA_BTS_boundaries[2])
+  , 'north_border' = c(NWA_BTS_boundaries[4])
+  , 'south_border' = c(NWA_BTS_boundaries[3])
+)
+
+NWA_BTS_extrap <- FishStatsUtils::make_extrapolation_info(Region = Region
+                                                          , strata.limits = NWA_BTS_stratalimits
+                                                          , input_grid = grid_NWA_BTS
+                                                          , observations_LL = Data_Geostat[,c("Lat", "Lon")]
+                                                          , flip_around_dateline = FALSE
+                                                          # , zone =  18 # UTM zone; use NA for automatic detection 
+                                                          , projargs = NA)
+Extrapolation_List = NWA_BTS_extrap
+
+```
+
+```{r, derived objects for VAST input}
+Spatial_List <- make_spatial_info(#grid_size_km = grid_size_km, 
+                                  n_x = n_x, 
+                                  Method = Method, 
+                                  Lon = NWA_illex_data[,'Lon'], 
+                                  Lat = NWA_illex_data[,'Lat'], 
+                                  Extrapolation_List = Extrapolation_List,
+                                  fine_scale = TRUE, 
+                                  DirPath=DateFile, 
+                                  Save_Results=TRUE ) 
+# Add knots to NEFSC.fall
+NWA_illex_data$knot_i <- Spatial_List$knot_i
+
+```
+
+```{r, enviro variables and VAST model settings}
+
+dat <- NWA_illex_data %>% dplyr::select(Lat, Lon, Year, PresJitter, AreaSwept_km2, Vessel) %>% droplevels() #swap out Catch_KG with PresJitter to do just encounter probability
+X <-  NWA_illex_data %>% dplyr::select(Lat, Lon, Year, Depth_M, BottomTemp_C, zenith) %>%
+  mutate(Depth_M2 = (Depth_M)^2, BottomTemp_C2 = (BottomTemp_C)^2)
+
+X$Depth_M <- (X$Depth_M - mean(X$Depth_M)) / sd(X$Depth_M)
+X$BottomTemp_C <- (X$BottomTemp_C - mean(X$BottomTemp_C)) / sd(X$BottomTemp_C)
+X$zenith <- (X$zenith - mean(X$zenith)) / sd(X$zenith)
+
+X$Depth_M2 <- (X$Depth_M2 - mean(X$Depth_M2)) / sd(X$Depth_M2)
+X$BottomTemp_C2 <- (X$BottomTemp_C2 - mean(X$BottomTemp_C2)) / sd(X$BottomTemp_C2)
+
+settings = make_settings(n_x = n_x, 
+                         Region = Region,
+                         use_anisotropy = TRUE,
+                         strata.limits = NWA_BTS_stratalimits,
+                         bias.correct = TRUE, 
+                         fine_scale = TRUE, 
+                         FieldConfig = FieldConfig,
+                         RhoConfig = RhoConfig,
+                        ObsModel = ObsModel,
+                        OverdispersionConfig = OverdispersionConfig,
+                        Options = Options,
+                        Version = Version
+                         )
+
+```
+
+Make the TMB-compatible data file, make a list of components needed to assemble the TMB function, configure settings, assign a destination to save the output. This part takes some time.
+```{r, build and run the model in VAST}
+
+TmbData = make_data(
+  "b_i" = NWA_illex_data[ ,'PresJitter'], 
+  "a_i" = NWA_illex_data[ ,'AreaSwept_km2'], 
+  "t_iz" = NWA_illex_data[ ,'Year'],
+  "c_i" = rep(0, nrow(NWA_illex_data)), 
+  # "v_i" = as.numeric(NWA_illex_data[,'Vessel'])-1, ############## !
+  "v_i" = as.numeric(NWA_illex_data[,'CatchSource'])-1,
+  # "Q_ik" = as.matrix(NWA_illex_data[ , 'zenith']), #catchability covariate(s)
+  "FieldConfig" = FieldConfig,
+  "spatial_list" = Spatial_List, 
+  "ObsModel"= ObsModel, 
+  "OverdispersionConfig" = OverdispersionConfig,
+  "RhoConfig" = RhoConfig,
+   "Aniso" = 1, 
+   # "covariate_data" = X,
+   # "formula" =  formula,
+  "Options" = Options,
+  "Version" = Version
+)
+
+
+TmbList = VAST::make_model("TmbData"=TmbData, 
+                           "RunDir"=DateFile, 
+                           "Version"=Version, 
+                           "RhoConfig"=RhoConfig, 
+                           "loc_x"=Spatial_List$loc_x, 
+                           "Method"=Method)
+
+Obj = TmbList[["Obj"]]
+
+Opt = TMBhelper::Optimize(obj=Obj, 
+                          lower=TmbList[["Lower"]], 
+                          upper=TmbList[["Upper"]], 
+                          getsd=TRUE, ##! Turn off for faster processing to check structure. Turn it back on if it works. 
+                          savedir=DateFile, 
+                          bias.correct=TRUE, ##! Turn off for faster processing to check structure. Turn it back on if it works.
+                          newtonsteps=1, 
+                          bias.correct.control=list(sd=FALSE, split=NULL, nsplit=1, vars_to_correct="Index_cyl") 
+                          )
+
+Report = Obj$report()
+Save = list("Opt"=Opt, "Report"=Report, "ParHat"=Obj$env$parList(Opt$par), "TmbData"=TmbData)
+save(Save, file=paste0(DateFile, "Save_VAST_output.RData"))
+
+
+```
+
+Run some basic diagnostics, plot the location data, plot observed encounter frequency against predicted probability, QQ and other diagnostic plots for positive catch data.
+```{r, outputs and diagnostics}
+
+#Convergence
+pander::pandoc.table(Opt$diagnostics[,c('Param','Lower','MLE','Upper','final_gradient')])
+write.csv(as.data.frame(Opt$diagnostics[,c('Param','Lower','MLE','Upper','final_gradient')]), file=paste0(DateFile, "parameterestimates.csv"), row.names = FALSE)
+# The lower and upper values are the parameter bounds. Make sure that the MLE is not hitting them. Make sure final_gradient is near zero.
+
+#Plot location data
+plot_data(Extrapolation_List=Extrapolation_List, 
+          Spatial_List=Spatial_List, 
+          Data_Geostat=NWA_illex_data, 
+          PlotDir=DateFile )
+
+#Diagnostic for encounter probability
+Enc_prob = plot_encounter_diagnostic(Report=Report, 
+                                     Data_Geostat=NWA_illex_data, 
+                                     DirName=DateFile)
+
+
+#Diagnostic for positive catch rate component
+Q = plot_quantile_diagnostic( TmbData=TmbData, 
+                              Report=Report, 
+                              FileName_PP="Posterior_Predictive",
+                              FileName_Phist="Posterior_Predictive-Histogram", 
+                              FileName_QQ="Q-Q_plot", 
+                              FileName_Qhist="Q-Q_hist", 
+                              DateFile=DateFile )
+
+```
+
+```{r, settings for maps}
+MapDetails_List = make_map_info(Region=Region
+                                , NN_Extrap = Spatial_List$PolygonList$NN_Extrap
+                                , spatial_list = Spatial_List
+                                , Extrapolation_List = Extrapolation_List
+                                , fine_scale = Spatial_List$fine_scale)
+
+# Decide which years to plot                                                   
+Year_Set = seq(min(NWA_illex_data[,'Year']),
+               max(NWA_illex_data[,'Year']))
+Years2Include = which(Year_Set %in% sort(unique(NWA_illex_data[,'Year'])))
+```
+
+```{r, plot residuals}
+plot_residuals(Lat_i=NWA_illex_data[,'Lat'], 
+               Lon_i=NWA_illex_data[,'Lon'], 
+               TmbData=TmbData, 
+               Report=Report, 
+               Q=Q, 
+               working_dir=DateFile,
+               spatial_list = Spatial_List,
+               extrapolation_list = Extrapolation_List,
+               Year_Set = Year_Set, 
+               Years2Include = Years2Include,   
+               mar=c(0,0,2,0), 
+               oma=c(3.5,3.5,0,0), 
+               cex=1.8)
+```
+
+```{r, anisotropy}
+#How do the properties change across directions? e.g. are locations more similar north-to-south vs east-to-west?
+plot_anisotropy( FileName=paste(DateFile,"Aniso.png", sep="/"), 
+                 Report=Report, 
+                 TmbData=TmbData )
+```
+
+```{r, encounter probability}
+Prob_xt = plot_maps(plot_set = 1 #set 1 is the probability of encounter
+                    # , MappingDetails=MapDetails_List[["MappingDetails"]]
+                    , Report = Report
+                    , Sdreport = Opt$SD
+                    , Year_Set = Year_Set
+                    , Years2Include = Years2Include
+                    , MapSizeRatio = MapDetails_List[["MapSizeRatio"]]
+                    , working_dir = DateFile
+                    , PlotDF = MapDetails_List[["PlotDF"]]
+                    , mar = c(0,0,2,0)
+                    , oma = c(3.5,3.5,0,0)
+                    , cex = 1.8
+)
+
+```
+
+```{r, range index}
+plot_range_index(Report=Report, 
+                 TmbData=TmbData, 
+                 Sdreport=Opt[["SD"]], 
+                 Znames=colnames(TmbData$Z_xm), 
+                 PlotDir=DateFile, 
+                 Year_Set=Year_Set)
+```
+
+```{r, save workspace}
+save.image(file=paste0(DateFile, "/SaveAll.Rdata"))
+
+```
+
+Save the probability values in a convenient format for plotting.
+```{r, save probability map values}
+probmapval <- as.data.frame(Save$Report$R1_gcy)
+
+colnames(probmapval) <- paste0(rep("Prob", ncol(probmapval)),Year_Set)
+  
+# probcoords <- filter(MapDetails_List$PlotDF, Include==TRUE)[,1:2]
+probcoords <- MapDetails_List$PlotDF[,1:2]
+
+probmap <- cbind(probcoords, probmapval)
+coordinates(probmap) <- c("Lat", "Lon")
+
+```
+
+Read in the EPU shapefile, get the area, and transform the projection to Mercator.
+```{r, read EPU shapefile(s)}
+
+#Loading a shape file of the EPUs
+epu_shp <- st_read(file.path('../EPU_shapefile',"EPU_extended.shp"),quiet = T)  
+
+plot(epu_shp)
+#Converting shape to one big area
+epu_shp$area <- st_area(epu_shp)
+NESLME <- epu_shp %>% summarise(area = sum(area)) 
+
+NESLME.mercator <- st_transform(NESLME, crs=CRS("+proj=utm +zone=19 +datum=WGS84"))
+
+NESLME %>% plot()
+
+lmepts <- as.data.frame(st_coordinates(NESLME))
+
+```
+
+```{r, make voronoi diagram}
+# function to create a polygon from the boundary box:
+bbox_polygon <- function(x) {
+  bb <- sf::st_bbox(x)
+
+  p <- matrix(
+    c(bb["xmin"], bb["ymin"], 
+      bb["xmin"], bb["ymax"],
+      bb["xmax"], bb["ymax"], 
+      bb["xmax"], bb["ymin"], 
+      bb["xmin"], bb["ymin"]),
+    ncol = 2, byrow = T
+  )
+
+  sf::st_polygon(list(p))
+}
+
+probmapdf <- as.data.frame(probmap)
+vorsf <- st_as_sf(probmapdf, coords= c("Lon", "Lat")) #convert dataframe to simple feature object
+str(vorsf)
+st_crs(vorsf) <- 4326 #this is the EPSG code for WGS84 coordinate system
+vorsf.mercator <- st_transform(vorsf, crs=CRS("+proj=utm +zone=19 +datum=WGS84")) #transform to mercator projection
+
+bb <- sf::st_bbox(vorsf)
+
+vorbox <- st_sfc(bbox_polygon(vorsf)) # create a simple feature geometry list column on the boundary box polygon
+head(vorsf)
+head(st_union(vorsf))
+
+vor <- st_voronoi(st_union(vorsf.mercator), vorbox)
+# plot(vor, col = 0)
+vorclip <- st_intersection(st_make_valid(st_cast(vor)), st_make_valid(NESLME.mercator)) #clip to EPU #
+plot(vorclip, col = 0)
+
+vorclip_att <- vorclip %>% data.frame(geometry = .) %>% st_sf() %>% st_join(., vorsf.mercator)
+
+vorclip_att <- gather(vorclip_att, key = "Year", value = "Probability", c(names(vorclip_att)[1:(ncol(vorclip_att)-1)]))
+
+vorclip_att$Year <- vorclip_att$Year %>% substr(5,8) %>% as.character() %>% as.numeric()#clean up the year labels
+
+```
+
+```{r, resave workspace}
+save.image(file=paste0(DateFile, "SaveAll.Rdata"))
+
+```
+
+#Get ready to repeat the processes across years and probabilitly thresholds. 
+
+Set up lists and matrices to save the outputs.
+```{r, make lists and matrices to save outputs}
+
+probthresh <- c(0.4, 0.6, 0.8) #probability thresholds to use
+effortlist <- vector(mode = "list", length = length(Year_Set)) #a place to store the effort .tifs
+plotlist <- vector(mode = "list", length = length(Year_Set)) #a place to save the plots for each year
+## probabilityspatiallist <- vector(mode = "list", length = length(Year_Set)-1) #a place to save the spatial objects for each year
+effortdat <- vector(mode = "list", length = length(Year_Set)) #a place to save the spatial objects for each year
+
+probabilityplots <- vector(mode = "list", length = length(Year_Set)) #a place to save the spatial objects for each year
+effortplots <- vector(mode = "list", length = length(Year_Set)) #a place to save the spatial objects for each year
+
+footprintarea <- matrix(data = NA, nrow = length(Year_Set), ncol = length(probthresh)) #fishing effort area matrix by year and threshold
+habitatarea <- matrix(data = NA, nrow = length(Year_Set), ncol = length(probthresh)) #habitat area matrix by year and threshold
+footprintRATIO <- matrix(data = NA, nrow = length(Year_Set), ncol = length(probthresh)) #ratio matrix by year and threshold
+
+```
+
+Write a  function to summarize voronoi areas by probability value.
+```{r, voronoi function}
+voronoiprobfun <- function(vorclip_att, year, prob) {
+areaX<- vorclip_att %>% filter(Year == year, Probability >= prob) 
+areaX$area <- areaX %>% st_area()
+areaX
+}
+```
+
+Write a function to  manipulate effort raster files.
+```{r, my raster function}
+
+myrasterfun <- function(illexeffort) {
+  effort_i <- raster(illexeffort)
+  effort_i_poly <- rasterToPolygons(effort_i, n=8)
+  effort_i_merc <- spTransform(effort_i_poly, CRSobj=CRS("+proj=utm +zone=19 +datum=WGS84"))
+  effort_i_merc <- st_as_sf(effort_i_merc) %>%
+                  st_union()
+  effort_i_merc
+} 
+
+```
+
+Loop through years (outer loop) to import all of the effort files, prepare them for analysis, calculate fishery footprint as a ratio of the area fished to habitat area, and save plots and spatial data. For each year, consider multiple thresholds of X% probability of occurrence (inner loop). *Note year indexing starts with 2001 because the Illex_2000.tif file is corrupt. Need to update when the repaired file is received.
+```{r, import effort files}
+
+effortfilelocation <- "../FD_catch/BG_BrookeW_Illex_spatial_use"
+library(raster)
+
+for(i in 1:length(Year_Set)) {
+  probspatial <- vector(mode = "list", length = length(probthresh))
+  footprintspatial <- vector(mode = "list", length = length(probthresh))
+  
+  for(j in 1:length(probthresh)){
+   areaX <- voronoiprobfun(vorclip_att = vorclip_att, year = Year_Set[i], prob = probthresh[j])
+   areaXsum <- areaX  %>% summarise(AREA = sum(area))
+
+   effort_i <- readGDAL(paste0(effortfilelocation,"/Illex_", Year_Set[i], ".tif"))
+   effort_i_merc <- myrasterfun(effort_i)
+
+   footprintX <- st_intersection(st_make_valid(st_cast(effort_i_merc)), st_make_valid(areaX))
+   footprintX <- st_as_sf(footprintX)
+   footprintX$area <- st_area(footprintX)
+   footprintplotX <- ggplot(data = footprintX) + geom_sf()
+   footprintXsum <- footprintX %>% summarize(AREA = sum(area))
+
+   footprintarea[i,j] <- footprintXsum$AREA / (1000^2) #convert m^2 to km^2
+   habitatarea[i,j] <- areaXsum$AREA  / (1000^2) #convert m^2 to km^2
+   footprintRATIO[i,j] <- (footprintXsum$AREA / areaXsum$AREA)
+
+   probspatial[[j]] <- areaX
+   footprintspatial[[j]] <- footprintX
+   } #close loop over probability thresholds
+  # 
+  ## probabilityspatiallist[[i]] <- probspatial
+  effortlist[[i]] <- footprintspatial
+  # probabilityplots[[i]] <- ggplot(data = filter(vorclip_att, Year == i)) +
+  #   geom_sf(aes(fill = Probability), lwd=0) + scale_fill_viridis_c()
+  effortdat[[i]] <- effort_i_merc
+} #close loop over years
+
+
+```
+
+Total effort area (including outside of habitat area)
+```{r, total effort area}
+totaleffortarea <- matrix(data = NA, nrow = length(Year_Set), ncol = 1) #fishing effort area matrix 
+# effortfilelocation <- "/net/home3/ajones/VASTbrooke/FD_catch/BG_BrookeW_Illex_spatial_use"
+effortfilelocation <- "../FD_catch/BG_BrookeW_Illex_spatial_use"
+library(raster)
+
+for(i in 1:length(Year_Set)) {
+
+   effort_i <- readGDAL(paste0(effortfilelocation,"/Illex_", Year_Set[i], ".tif"))
+   effort_i_merc <- myrasterfun(effort_i)
+
+   totaleffortX <- st_as_sf(effort_i_merc)
+   totaleffortX$area <- st_area(totaleffortX)
+   totaleffortsum <- totaleffortX %>% summarize(AREA = sum(area))
+
+   totaleffortarea[i] <- totaleffortsum$AREA / (1000^2) #convert m^2 to km^2
+
+} #close loop over years
+
+```
+
+Finishing touches: name the rows and columns of the output matrices. Save them as .csv files.
+```{r, cleanup and save the outputs}
+footprintarea <- as.data.frame(cbind(Year_Set[1:length(Year_Set)], footprintarea))
+names(footprintarea) = c("Year", paste0("Prob_", probthresh*100))
+write_csv(footprintarea, paste0(DateFile, "effort.csv"))
+
+habitatarea <-   as.data.frame(cbind(Year_Set[1:length(Year_Set)], habitatarea))
+names(habitatarea) = c("Year", paste0("Prob_", probthresh*100))
+write_csv(habitatarea, paste0(DateFile, "habitat.csv"))
+
+footprintRATIO <- as.data.frame(cbind(Year_Set, footprintRATIO))
+names(footprintRATIO) = c("Year", paste0("Prob_", probthresh*100))
+write_csv(footprintRATIO, paste0(DateFile, "footprintratio.csv"))
+
+totaleffortarea <- as.data.frame(cbind(Year_Set[1:length(Year_Set)], totaleffortarea))
+names(totaleffortarea) = c("Year", "EffortArea")
+write_csv(totaleffortarea, paste0(DateFile, "totaleffort.csv"))
+
+print("Proportion of Habitat Area Fished", quote = FALSE)
+print("Habitat defined as 40, 60, or 80% Probability of Occurrence", quote = FALSE)
+kable(footprintRATIO)
+
+```
+
+```{r, get coastline data}
+reg = map_data("world2Hires")
+reg = subset(reg, region %in% c('Canada', 'USA'))
+reg$long = (360 - reg$long)*-1 
+```
+
+Figure 3: Probability of occurrence maps. DO NOT USE IN MANUSCRIPT.
+```{r, probability of occurrence maps}
+
+###### bin the probabilities ###### 
+vorclip_att$Probability2 <- cut(vorclip_att$Probability
+                                       , breaks = c(0, 0.2, 0.4, 0.6, 0.8, 1.0)
+                                       , labels = c("Less than 20%", "At least 20%"
+                                                    , "At least 40%", "At least 60%"
+                                                    , "Atleast 80%")
+                                       )
+##### make the plot for one year ##### 
+# probpanelone_cat <- ggplot() +
+#     geom_sf(data = vorclip_att[which(vorclip_att$Year== 2000),,] %>% st_transform(crs="+proj=longlat +datum=WGS84"), aes(fill = Probability2), color = NA, lwd = 0) +
+#     scale_fill_brewer(palette = "Purples") +
+#     geom_polygon(data = reg, aes(x=long, y = lat, group = group),fill = 'black') +
+#     ggtitle(Year_Set[1]) +
+#     geom_sf(data = effortdat[[1]], aes(color="red"), alpha = 0) +
+#     guides(color = FALSE) +
+#     coord_sf(xlim = c(-77.5,-65.5), ylim = c(33.5,44.5)) +
+#     theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5))
+# probpanelone_cat
+
+##### Make a list object of probability maps with effort overlaid. ##### 
+prmaps <- list()
+prmapscat <- list()
+
+for (i in 1:length(Year_Set)){
+ 
+  # #plot with probability gradient
+  # probpanel <- ggplot() +
+  #   geom_sf(data = vorclip_att[which(vorclip_att$Year== Year_Set[i]),,]  %>%
+  #             st_transform(crs="+proj=longlat +datum=WGS84"), aes(fill = Probability), color = NA, lwd = 0) +
+  #   scale_fill_viridis_c() +
+  #   geom_polygon(data = reg, aes(x=long, y = lat, group = group),fill = 'black') +
+  #   ggtitle(Year_Set[i]) +
+  #   geom_sf(data = effortdat[[i]], aes(color="red"), alpha = 0) +
+  #   guides(color = FALSE) +
+  #   coord_sf(xlim = c(-77.5,-65.5), ylim = c(33.5,44.5)) +
+  #   theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5))
+  # prmaps[[i]] <- probpanel
+  
+    probpanelcat <- ggplot() +
+    geom_sf(data = vorclip_att[which(vorclip_att$Year== Year_Set[i]),,] %>% 
+              st_transform(crs="+proj=longlat +datum=WGS84"), aes(fill = Probability2), color = NA, lwd = 0) +
+    scale_fill_brewer(palette = "Purples") +
+    # scale_fill_brewer(palette = "Greys") +
+    geom_polygon(data = reg, aes(x=long, y = lat, group = group),fill = 'black') +
+    ggtitle(Year_Set[i]) +
+    geom_sf(data = effortdat[[i]], aes(color="red"), alpha = 0) +
+    guides(color = FALSE) +
+    coord_sf(xlim = c(-77.5,-65.5), ylim = c(33.5,44.5)) +
+    theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5))
+  prmapscat[[i]] <- probpanelcat
+  }
+
+###### set the themes for the plot panels ##### 
+themeleft <- theme(plot.title = element_text(hjust = 0.5)
+                  , axis.ticks.x = element_blank()
+                  , axis.text.x = element_blank()
+                  , axis.title.x = element_blank()
+                  , legend.position = "none")
+
+themeinner <- theme(plot.title = element_text(hjust = 0.5)
+                    , axis.ticks = element_blank()
+                    , axis.text.x = element_blank()
+                    , axis.text.y = element_blank()
+                    , axis.title = element_blank()
+                    , legend.position = "none")
+
+themecorner <- theme(plot.title = element_text(hjust = 0.5))
+
+themebottom <- theme(plot.title = element_text(hjust = 0.5)
+                     , axis.ticks.y = element_blank()
+                     , axis.text.y= element_blank()
+                     , axis.title.y = element_blank()
+                     , legend.position = "none")
+
+##### patchwork of probability gradient maps ######
+# probgradientpatch <-
+#   (prmaps[[1]] + ggtitle(Year_Set[1]) + themeleft) +
+#   (prmaps[[2]] + ggtitle(Year_Set[2]) + themeinner) +
+#   (prmaps[[3]] + ggtitle(Year_Set[3]) + themeinner) +
+#   (prmaps[[4]] + ggtitle(Year_Set[4]) + themeinner) +
+#   (prmaps[[5]] + ggtitle(Year_Set[5]) + themeinner) +
+#   (prmaps[[6]] + ggtitle(Year_Set[6]) + themeleft) +
+#   (prmaps[[7]] + ggtitle(Year_Set[7]) + themeinner) +
+#   (prmaps[[8]] + ggtitle(Year_Set[8]) + themeinner) +
+#   (prmaps[[9]] + ggtitle(Year_Set[9]) + themeinner) +
+#   (prmaps[[10]] + ggtitle(Year_Set[10]) + themeinner) +
+#   (prmaps[[11]] + ggtitle(Year_Set[11]) + themeleft) +
+#   (prmaps[[12]] + ggtitle(Year_Set[12]) + themeinner) +
+#   (prmaps[[13]] + ggtitle(Year_Set[13]) + themeinner) +
+#   (prmaps[[14]] + ggtitle(Year_Set[14]) + themeinner) +
+#   (prmaps[[15]] + ggtitle(Year_Set[15]) + themeinner) +
+#   (prmaps[[16]] + ggtitle(Year_Set[16]) + themecorner) +
+#   (prmaps[[17]] + ggtitle(Year_Set[17]) + themebottom) +
+#   (prmaps[[18]] + ggtitle(Year_Set[18]) + themebottom) +
+#   (prmaps[[19]] + ggtitle(Year_Set[19]) + themebottom) +
+#   # (prmaps[[20]] + ggtitle(Year_Set[20]) + themebottom) +
+#  plot_layout(ncol = 5, nrow = 4, guides = "collect")
+#  # plot_layout(ncol = 4, nrow = 5, guides = NULL)
+# 
+# ggsave(file = paste0(DateFile, "/probgradient_effort.jpg")
+#        , probgradientpatch, device = "jpeg", width = 10, height = 10, unit = "in")
+
+##### patchwork of probability category maps ##### 
+
+probcategorypatch <-
+  (prmapscat[[1]] + ggtitle(Year_Set[1]) + themeleft) +
+  (prmapscat[[2]] + ggtitle(Year_Set[2]) + themeinner) +
+  (prmapscat[[3]] + ggtitle(Year_Set[3]) + themeinner) +
+  (prmapscat[[4]] + ggtitle(Year_Set[4]) + themeinner) +
+  (prmapscat[[5]] + ggtitle(Year_Set[5]) + themeinner) +
+  (prmapscat[[6]] + ggtitle(Year_Set[6]) + themeleft) +
+  (prmapscat[[7]] + ggtitle(Year_Set[7]) + themeinner) +
+  (prmapscat[[8]] + ggtitle(Year_Set[8]) + themeinner) +
+  (prmapscat[[9]] + ggtitle(Year_Set[9]) + themeinner) +
+  (prmapscat[[10]] + ggtitle(Year_Set[10]) + themeinner) +
+  (prmapscat[[11]] + ggtitle(Year_Set[11]) + themeleft) +
+  (prmapscat[[12]] + ggtitle(Year_Set[12]) + themeinner) +
+  (prmapscat[[13]] + ggtitle(Year_Set[13]) + themeinner) +
+  (prmapscat[[14]] + ggtitle(Year_Set[14]) + themeinner) +
+  (prmapscat[[15]] + ggtitle(Year_Set[15]) + themeinner) +
+  (prmapscat[[16]] + ggtitle(Year_Set[16]) + themecorner) +
+  (prmapscat[[17]] + ggtitle(Year_Set[17]) + themebottom) +
+  (prmapscat[[18]] + ggtitle(Year_Set[18]) + themebottom) +
+  (prmapscat[[19]] + ggtitle(Year_Set[19]) + themebottom) +
+  # (prmapscat[[20]] + ggtitle(Year_Set[20]) + themebottom) +
+ plot_layout(ncol = 5, nrow = 4, guides = "collect")
+ # plot_layout(ncol = 4, nrow = 5, guides = NULL)
+
+ggsave(file = paste0(DateFile, "/probcategory_effort.jpg")
+       , probcategorypatch, device = "jpeg", width = 10, height = 10, unit = "in")
+
+```
+
+Figure 4: Time series of availability to the fishery and of % habitat occupied. 
+```{r, time series}
+RATIOgather <- gather(footprintRATIO, key = "Threshold", value = "Probability", -Year)
+AREAgather <- gather(habitatarea, key = "Threshold", value = "Area", -Year)
+
+fig4A <- ggplot(data = totaleffortarea, aes(x = Year, y = EffortArea)) +
+  geom_line(lwd=1.2) +
+  labs(#title = "Approximate Area Fished",
+       x = "Year",
+       y = "Area (sq km)") +
+  scale_x_continuous(labels = min(RATIOgather$Year):max(RATIOgather$Year), breaks = min(RATIOgather$Year):max(RATIOgather$Year)) +
+  scale_y_continuous(labels = scales::comma) +
+  theme_bw() +
+  theme(text = element_text(size = 16),
+        axis.text.x = element_text(color = "grey20", size = 12, angle = 30, hjust = 1),
+        axis.text.y = element_text(color = "grey20", size = 12),
+        plot.title = element_text(hjust = 0.5)) +
+  annotate("text", x = 2000, y = 15000, label = "A") +
+  theme(legend.position = "bottom")
+
+fig4B <- ggplot(data = AREAgather, aes(x = Year, y = Area, color = Threshold)) +
+  geom_line(lwd=1.2) +
+  labs(#title = "Habitat Area Based on\n Percent Probability Occurrence",
+       x = "Year",
+       y = "Area (sq km)") +
+  # scale_color_manual(values = c(brewer.pal(7, "Purples"))[c(3,5,7)],
+   scale_color_manual(values = c(brewer.pal(8, "Greys"))[c(4,6,8)],
+                      name = "Probability Threshold",
+                       breaks = levels(as.factor(RATIOgather$Threshold)),
+                       labels = c("40%", "60%", "80%")) +
+  scale_x_continuous(labels = min(RATIOgather$Year):max(RATIOgather$Year), breaks = min(RATIOgather$Year):max(RATIOgather$Year)) +
+  scale_y_continuous(labels = scales::comma) +
+  theme_bw() +
+  theme(text = element_text(size = 16),
+        axis.text.x = element_text(color = "grey20", size = 12, angle = 30, hjust = 1),
+        axis.text.y = element_text(color = "grey20", size = 12),
+        plot.title = element_text(hjust = 0.5)) +
+  annotate("text", x = 2000, y = 148000, label = "B") +
+  theme(legend.position = "bottom")
+
+fig4C <- ggplot(data = RATIOgather, aes(x = Year, y = Probability, color = Threshold)) +
+  geom_line(lwd=1.2) +
+  labs(#title = "Illex habitat availability to the fishery",
+       x = "Year",
+       y = "Percent fishery overlap \n with habitat") +
+  # scale_color_manual(values = c(brewer.pal(7, "Purples"))[c(3,5,7)],
+  scale_color_manual(values = c(brewer.pal(8, "Greys"))[c(4,6,8)],
+                       name = "Probability Threshold",
+                       breaks = levels(as.factor(RATIOgather$Threshold)),
+                       labels = c("40%", "60%", "80%")) +
+scale_x_continuous(labels = min(RATIOgather$Year):max(RATIOgather$Year), breaks = min(RATIOgather$Year):max(RATIOgather$Year)) +
+    scale_y_continuous(labels = scales::percent) +
+  theme_bw() +
+  theme(text = element_text(size = 16),
+        axis.text.x = element_text(color = "grey20", size = 12, angle = 30, hjust = 1),
+        axis.text.y = element_text(color = "grey20", size = 12),
+        plot.title = element_text(hjust = 0.5)) +
+  annotate("text", x = 2000, y = 0.345, label = "C") +
+  theme(legend.position = "bottom")
+  
+
+fig4 <- fig4A / fig4B / fig4C
+
+ggsave(paste0(DateFile,"/Fig4A_availability.png"), fig4A, width = 10, dpi = 300)
+ggsave(paste0(DateFile,"/Fig4B_habitatarea.png"), fig4B, width = 10, dpi = 300)
+ggsave(paste0(DateFile,"/Fig4C_habitatarea.png"), fig4C, width = 10, dpi = 300)
+
+ggsave(paste0(DateFile,"/Fig4_habitatarea.jpg"), fig4, device = "jpeg", width = 7, height = 10, unit = "in")
+
+```
+
+```{r, resave workspace}
+save.image(file=paste0(DateFile, "SaveAll.Rdata"))
+```
+
+Figure 1: Map of survey Coverage.
+```{r, map of survey data}
+# NWA_illex_data$Survey <- as.character(NWA_illex_data$Vessel) %>%
+#   replace(list = which(NWA_illex_data$Vessel %in% c("Albatros", "Bigelow")), values = "NEFSC") %>% as.factor()
+NWA_illex_data$CatchSource <- as.character(NWA_illex_data$Vessel) %>%
+  # replace(list = which(NWA_illex_data$Vessel %in% c("Albatros", "Bigelow")), values = "NEFSC") %>% 
+  replace(list = which(NWA_illex_data$Vessel %in% unique(NWA_illex_data2$Vessel)), values = "Study Fleet") %>% 
+  as.factor()
+
+NWA_illex_data$Pres <- factor(NWA_illex_data$Pres, levels = c(0,1), labels = c("Absent", "Present"))
+
+# cbpalette <- c("#000000", "#56B4E9", "#D55E00")
+Preslabs <- c("Absent", "Present")
+names(Preslabs) <- c(0,1)
+
+surveycoverage <- ggplot() +
+  geom_point(data = NWA_illex_data, aes(x = Lon, y = Lat, color = as.factor(CatchSource), shape = I(4)), alpha = 0.5, show.legend = c(color = TRUE, shape = FALSE)) +
+  scale_color_manual(name = "Catch Source", position = "bottom", values = c(brewer.pal(10, "Paired")[c(1,2,4,6,10)])) +
+  geom_polygon(data = reg, aes(x=long, y = lat, group = group),fill = 'grey20') +
+  coord_sf(xlim = c(-77.5,-65.5), ylim = c(33.5,44.5)) +
+  # facet_wrap(~as.factor(Year)) +
+  theme_bw() + 
+  # theme(legend.position = "bottom")
+  theme(legend.position = "right") +
+  facet_wrap(~Pres, labeller = labeller(Pres = Preslabs))
+
+surveycoverage
+
+ggsave(file = paste0(DateFile, "surveyandstudyfleetdatamap.jpg")
+       , surveycoverage, device = "jpeg", width = 10, height = 10, unit = "in")
+# ggsave(file = "../VAST_manuscript/NMFS-NEAMAP-MENH-SF-datamap-by-year.jpg"
+#        , surveycoverage, device = "jpeg", width = 10, height = 10, unit = "in")
+
+```
+
+
+```{r, look at some stuff}
+unique(NWA_illex_data[which(NWA_illex_data$Vessel=="Albatros"), "Year"])
+unique(NWA_illex_data[which(NWA_illex_data$Vessel=="Bigelow"), "Year"])
+
+NWA_illex_data %>% count(Vessel)
+NWA_illex_data %>% group_by(Pres) %>% count(Vessel) %>% 
+  pivot_wider(id_cols = Vessel, names_from = Pres, values_from = n) %>%
+  View()
+
+vesyearsummary <- NWA_illex_data %>% 
+  group_by(CatchSource, Year, Pres) %>% count(Vessel) %>% 
+  pivot_wider(names_from = Pres, values_from = n) %>%
+  rename("Abs" = "0", "Pres" = "1") %>%
+  replace_na(list(Abs = 0, Pres = 0)) %>%
+  mutate(ProportionPres = Pres/(Abs+Pres))
+propposcatch1 <- ggplot(data = vesyearsummary) + 
+  geom_line(aes(x = Year, y = ProportionPres, group = Vessel, color = CatchSource)) +
+  labs(title = "Positive Catches by Vessel",
+       y = "Proportion of Positive Catches")
+
+catchsourcesummary <- vesyearsummary %>% 
+  group_by(CatchSource, Year) %>% 
+  summarise(minp = min(ProportionPres),
+            maxp = max(ProportionPres),
+            meanp= mean(ProportionPres)) 
+propposcatch2 <- ggplot(data = catchsourcesummary) + 
+  geom_line(aes(x = Year, y = meanp, color = CatchSource)) +
+  labs(title = "Positive Catches by Data Source",
+       y = "Mean Proportion of Positive Catches")
+
+propposcatch1 + propposcatch2
+ggsave("C:/Users/brooke.wright/Documents/BWRIGHT_NOAA/Illex/IllexData/VAST_manuscript/positivecatches.png",
+       propposcatch1 + propposcatch2, width = 10, dpi = 300)
+
+ggplot(data = NWA_illex_data) + 
+  geom_jitter(aes(x = Vessel, y = AreaSwept_km2, color = as.factor(Year)), alpha =0.5) +
+  geom_boxplot(aes(x = Vessel, y = AreaSwept_km2), fill = NA) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggplot(data = NWA_illex_data) + geom_jitter(aes(x = Year, y = AreaSwept_km2, color = Vessel)) +
+  theme(legend.position = "none")
+
+
+```
+
+Figure 3: Probability of occurrence maps with effort overlaid. NONCONFIDENTIAL FOR PUBLICATION.
+```{r, remake probability of occurrence maps (Fig 2) with NONCONFIDENTIAL effort data overlaid}
+library(raster)
+effortdat_nonconf <- vector(mode = "list", length = length(Year_Set)) #a place to save the spatial objects for each year
+
+effortfilelocation2 <- "../FD_catch/illex_1996-2020_non-conf"
+
+for(i in 1:length(Year_Set)) {
+
+   effort_i <- readGDAL(paste0(effortfilelocation2,"/Illex_nonconf_", Year_Set[i], ".tif"))
+   effort_i_merc <- myrasterfun(effort_i)
+   effortdat_nonconf[[i]] <- effort_i_merc
+} #close loop over years
+
+
+prmapscat2 <- list()
+
+for (i in 1:length(Year_Set)){
+ 
+    probpanelcat <- ggplot() +
+    geom_sf(data = vorclip_att[which(vorclip_att$Year== Year_Set[i]),,] %>% 
+              st_transform(crs="+proj=longlat +datum=WGS84"), aes(fill = Probability2), color = NA, lwd = 0) +
+    # scale_fill_brewer(palette = "Purples") +
+    scale_fill_brewer(palette = "Greys", name = "Probability of Occurrence") +
+    geom_polygon(data = reg, aes(x=long, y = lat, group = group),fill = 'black') +
+    ggtitle(Year_Set[i]) +
+    geom_sf(data = effortdat_nonconf[[i]], aes(color=I("green")), alpha = 0) +
+    guides(color = FALSE) +
+    coord_sf(xlim = c(-77.5,-65.5), ylim = c(33.5,44.5)) +
+    theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5))
+  prmapscat2[[i]] <- probpanelcat
+  }
+
+probcategorypatch_nonconf <-
+  (prmapscat2[[1]] + ggtitle(Year_Set[1]) + themeleft) +
+  (prmapscat2[[2]] + ggtitle(Year_Set[2]) + themeinner) +
+  (prmapscat2[[3]] + ggtitle(Year_Set[3]) + themeinner) +
+  (prmapscat2[[4]] + ggtitle(Year_Set[4]) + themeinner) +
+  (prmapscat2[[5]] + ggtitle(Year_Set[5]) + themeinner) +
+  (prmapscat2[[6]] + ggtitle(Year_Set[6]) + themeleft) +
+  (prmapscat2[[7]] + ggtitle(Year_Set[7]) + themeinner) +
+  (prmapscat2[[8]] + ggtitle(Year_Set[8]) + themeinner) +
+  (prmapscat2[[9]] + ggtitle(Year_Set[9]) + themeinner) +
+  (prmapscat2[[10]] + ggtitle(Year_Set[10]) + themeinner) +
+  (prmapscat2[[11]] + ggtitle(Year_Set[11]) + themeleft) +
+  (prmapscat2[[12]] + ggtitle(Year_Set[12]) + themeinner) +
+  (prmapscat2[[13]] + ggtitle(Year_Set[13]) + themeinner) +
+  (prmapscat2[[14]] + ggtitle(Year_Set[14]) + themeinner) +
+  (prmapscat2[[15]] + ggtitle(Year_Set[15]) + themeinner) +
+  (prmapscat2[[16]] + ggtitle(Year_Set[16]) + themecorner) +
+  (prmapscat2[[17]] + ggtitle(Year_Set[17]) + themebottom) +
+  (prmapscat2[[18]] + ggtitle(Year_Set[18]) + themebottom) +
+  (prmapscat2[[19]] + ggtitle(Year_Set[19]) + themebottom) +
+  # (prmapscat[[20]] + ggtitle(Year_Set[20]) + themebottom) +
+ plot_layout(ncol = 5, nrow = 4, guides = "collect")
+ # plot_layout(ncol = 4, nrow = 5, guides = NULL)
+
+ggsave(file = paste0(DateFile, "/probcategory_effort_nonconf.jpg")
+       , probcategorypatch_nonconf, device = "jpeg", width = 10, height = 10, unit = "in")
+
+```
+
+
+Figure xx: Effort on map with isobaths.
+```{r, isobaths}
+library(marmap)
+atl <- marmap::getNOAA.bathy(-80,-62, 30, 48, res = 1, keep=TRUE)
+library(raster)
+
+effortdat_nonconf <- vector(mode = "list", length = length(Year_Set)) #a place to save the spatial objects for each year
+
+effortfilelocation2 <- "../FD_catch/illex_1996-2020_non-conf"
+
+for(i in 1:length(Year_Set)) {
+
+   effort_i <- readGDAL(paste0(effortfilelocation2,"/Illex_nonconf_", Year_Set[i], ".tif"))
+   effort_i_merc <- myrasterfun(effort_i)
+   effortdat_nonconf[[i]] <- effort_i_merc
+} #close loop over years
+
+
+isomaps <- list()
+
+for (i in 1:length(Year_Set)){
+ 
+    isomappanel <- ggplot() +
+    geom_polygon(data = reg, aes(x=long, y = lat, group = group),fill = 'black') +
+    ggtitle(Year_Set[i]) +
+    geom_contour(data = atl,
+                aes(x=x, y=y, z=z),
+                breaks=c(-50,-100,-300,-500, -1000),
+                size=c(0.3),
+                colour="black",alpha=0.15) +
+    geom_sf(data = effortdat_nonconf[[i]]%>% 
+              st_transform(crs="+proj=longlat +datum=WGS84"), aes(color=I("red")), alpha = 0) +
+    guides(color = FALSE) +
+    coord_sf(xlim = c(-77.5,-65.5), ylim = c(33.5,44.5)) +
+      theme_minimal() +
+    theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5))
+  isomaps[[i]] <- isomappanel
+  }
+
+isomaps_patch <-
+  (isomaps[[1]] + ggtitle(Year_Set[1]) + themeleft) +
+  (isomaps[[2]] + ggtitle(Year_Set[2]) + themeinner) +
+  (isomaps[[3]] + ggtitle(Year_Set[3]) + themeinner) +
+  (isomaps[[4]] + ggtitle(Year_Set[4]) + themeinner) +
+  (isomaps[[5]] + ggtitle(Year_Set[5]) + themeinner) +
+  (isomaps[[6]] + ggtitle(Year_Set[6]) + themeleft) +
+  (isomaps[[7]] + ggtitle(Year_Set[7]) + themeinner) +
+  (isomaps[[8]] + ggtitle(Year_Set[8]) + themeinner) +
+  (isomaps[[9]] + ggtitle(Year_Set[9]) + themeinner) +
+  (isomaps[[10]] + ggtitle(Year_Set[10]) + themeinner) +
+  (isomaps[[11]] + ggtitle(Year_Set[11]) + themeleft) +
+  (isomaps[[12]] + ggtitle(Year_Set[12]) + themeinner) +
+  (isomaps[[13]] + ggtitle(Year_Set[13]) + themeinner) +
+  (isomaps[[14]] + ggtitle(Year_Set[14]) + themeinner) +
+  (isomaps[[15]] + ggtitle(Year_Set[15]) + themeinner) +
+  (isomaps[[16]] + ggtitle(Year_Set[16]) + themecorner) +
+  (isomaps[[17]] + ggtitle(Year_Set[17]) + themebottom) +
+  (isomaps[[18]] + ggtitle(Year_Set[18]) + themebottom) +
+  (isomaps[[19]] + ggtitle(Year_Set[19]) + themebottom) +
+  # (isomaps[[20]] + ggtitle(Year_Set[20]) + themebottom) +
+ plot_layout(ncol = 5, nrow = 4, guides = "collect")
+ # plot_layout(ncol = 4, nrow = 5, guides = NULL)
+
+ggsave(file = paste0(DateFile, "/isobath_map_panels.jpg")
+       , isomaps_patch, device = "jpeg", width = 10, height = 10, unit = "in")
+
+isomap_aggyears <- ggplot() +
+    geom_polygon(data = reg, aes(x=long, y = lat, group = group),fill = 'black') +
+    geom_contour(data = atl, aes(x=x, y=y, z=z), breaks=c(-50,-100,-300,-500, -1000),
+                size=c(0.3), colour="black", alpha=0.5) +
+    geom_sf(data = effortdat_nonconf[[1]]%>% 
+              st_transform(crs="+proj=longlat +datum=WGS84"), aes(color=I("red")), alpha = 0) +
+    geom_sf(data = effortdat_nonconf[[2]], aes(color=I("red")), alpha = 0) +
+    geom_sf(data = effortdat_nonconf[[3]], aes(color=I("red")), alpha = 0) +
+    geom_sf(data = effortdat_nonconf[[4]], aes(color=I("red")), alpha = 0) +
+    geom_sf(data = effortdat_nonconf[[5]], aes(color=I("red")), alpha = 0) +
+    geom_sf(data = effortdat_nonconf[[6]], aes(color=I("red")), alpha = 0) +
+    geom_sf(data = effortdat_nonconf[[7]], aes(color=I("red")), alpha = 0) +
+    geom_sf(data = effortdat_nonconf[[8]], aes(color=I("red")), alpha = 0) +
+    geom_sf(data = effortdat_nonconf[[9]], aes(color=I("red")), alpha = 0) +
+    geom_sf(data = effortdat_nonconf[[10]], aes(color=I("red")), alpha = 0) +
+    geom_sf(data = effortdat_nonconf[[11]], aes(color=I("red")), alpha = 0) +
+    geom_sf(data = effortdat_nonconf[[12]], aes(color=I("red")), alpha = 0) +
+    geom_sf(data = effortdat_nonconf[[13]], aes(color=I("red")), alpha = 0) +
+    geom_sf(data = effortdat_nonconf[[14]], aes(color=I("red")), alpha = 0) +
+    geom_sf(data = effortdat_nonconf[[15]], aes(color=I("red")), alpha = 0) +
+    geom_sf(data = effortdat_nonconf[[16]], aes(color=I("red")), alpha = 0) +
+    geom_sf(data = effortdat_nonconf[[17]], aes(color=I("red")), alpha = 0) +
+    geom_sf(data = effortdat_nonconf[[18]], aes(color=I("red")), alpha = 0) +
+    geom_sf(data = effortdat_nonconf[[19]], aes(color=I("red")), alpha = 0) +
+    # geom_sf(data = effortdat_nonconf[[20]], aes(color=I("red")), alpha = 0) +
+  guides(color = FALSE) +
+    coord_sf(xlim = c(-77.5,-65.5), ylim = c(33.5,44.5)) +
+      theme_minimal() 
+
+ggsave(file = paste0(DateFile, "/isobath_map_aggregated.jpg")
+       , isomap_aggyears, device = "jpeg", width = 10, height = 10, unit = "in")
+
+
+```
