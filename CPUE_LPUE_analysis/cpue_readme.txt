@@ -1,0 +1,1 @@
+The files and code in this folder are for fishery dependent indices of abundance of I. illecebrosus. These include plots of time series; GLMs to standardize the CPUE and LPUE series from dealer/logbook, observer, and study fleet data; and a shiny app to explore/visualize the data and standardized series.
