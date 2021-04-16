@@ -1,0 +1,1 @@
+The code and files in this folder are for building a GAM to describe the distribution of I. illecebrosus based on data from the NEFSC, MA DMF, Canada DFO, MENH, and NEAMAP bottom trawl surveys. A fishery footprint from VMS data is overlaid, and the overlap is calculated as an approximation of potential fishery impact on the stock.
