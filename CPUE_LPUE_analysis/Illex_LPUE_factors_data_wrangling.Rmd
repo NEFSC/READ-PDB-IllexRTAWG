@@ -1,0 +1,193 @@
+---
+title: "Data Wrangling for Illex LPUE Factors"
+author: "Brooke Lowman"
+date: "10/7/2021"
+output: 
+  html_document:
+    code_fold: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load libraries, echo = TRUE, include= FALSE}
+library(tidyverse)
+library(readxl)
+library(lubridate)
+```
+
+## Hold Type
+* Harvesters consistently emphasized that hold type is a critical factor affecting LPUE. 
+* Vessel hold types (ice, RSW, freezer trawler) were determined by consultation with vessel owners, processors, key industry representatives, and/or port agents. For details, see [**CooperativeResearchBranch/CRBProgramsProjects/IllexSquid/vessel_type_compare_all_CRB_LH**](https://drive.google.com/drive/folders/1sx3jkudmx2dZLXrxkrKlKVQ5yfwE2HuE).
+* A small number of vessels were converted from one hold type to another. These are documented in the Google sheet linked above and locally in **vessel_type_2021.xlsx**. We use the original hold type to join the tables, then we update it in the catch data using ifelse() commands to change the hold type for the relevant vessels and years.
+
+```{r vessel hold type}
+vesshold <- read_excel("vessel_type_2021.xlsx",
+                       sheet = "vessel_type",
+                       ) %>%
+               rename(VESSHOLD = Vess_type_Final) %>%
+               mutate(VESSHOLD = str_to_upper(VESSHOLD))
+
+vesshold %>% filter(!(VESSHOLD %in% c("ICE", "FT", "RSW"))) %>% 
+  dplyr::select("PERMIT", "COMMENT")
+
+```
+
+## Domestic Illex Prices
+* Domestic prices for Illex by week are included because some harvesters noted that their fishing behavior changes with price. For example, when price is high they may stay on a less dense aggregation of squid when they would otherwise move onto search for denser fishing ground (i.e. they will accept a lower LPUE when price is high).
+* Price data was pulled from the Commercial Fisheries Database (CFDBS) using R code written by Chad Demerest and updated by Andy Jones (ChadsPrices.Rmd). Price is calculated based on total landed value divided by the total landings (pounds) for each week. 
+* Prices are adjusted for inflation by standardizing to 2019 USD using the Gross Domestic Product Implicit Pride Deflator from [Federal Reserve Economic Data](https://fred.stlouisfed.org).
+* When joining the price table to the catch data, the prices should be lagged one week relative to the start of the trip (to reflect the fact that fishing decisions are made based on the information available when boats leave the dock, not the price when they land). 
+
+```{r domestic Illex price}
+domprice <- read.csv("Illex_pricedata_1997-2019_bytrip.csv")
+skimr::skim(domprice)
+## make sure to: 1 - adjust for inflation, 2 - correct the fleet designation, 3 - summarize by week
+
+doladjust <- read_excel("Copy of DolAdj.xlsx",
+                        sheet = "factor - 2019 dollars",
+                        skip = 11,
+                        trim_ws = TRUE,
+                        col_names = c("YEAR", 
+                                      "GDPDEF", 
+                                      "BLANK1", "BLANK2", "BLANK3",
+                                      "ADJUSTMENT", 
+                                      "NOTES")) %>%
+               dplyr::select("YEAR", "ADJUSTMENT") %>%
+               mutate("YEAR" = substr(YEAR, start = 1, stop = 4) %>% as.numeric())
+
+domprice <- left_join(domprice, doladjust, by = "YEAR") %>%
+  mutate("DOLLARSADJ" = round(DOLLARS*ADJUSTMENT, 2),
+         "MONTH" = str_pad(MONTH, width = 2, side = "left", pad = "0"),
+         "DAY" = str_pad(DAY, width = 2, side = "left", pad = "0"),
+         "DATE" = paste0(YEAR, MONTH, DAY, sep = "-") %>% as_date(),
+         "WEEK" = week(DATE),
+         "FLEET" = NA
+           ) %>%
+  dplyr::select("PERMIT", "FLEET", "DATE", "DOLLARSADJ", "POUNDS", "YEAR", "WEEK")
+
+domprice <- left_join(domprice, vesshold[,c(1:3)], by = "PERMIT")
+
+vesshold %>% filter(!(VESSHOLD %in% c("ICE", "FT", "RSW"))) %>% 
+  dplyr::select("PERMIT", "COMMENT")
+
+domprice$VESSHOLD <- ifelse((domprice$PERMIT==410371 & domprice$YEAR <= 2020), "FT", domprice$VESSHOLD)
+domprice$VESSHOLD <- ifelse((domprice$PERMIT==410371 & domprice$YEAR > 2020), "RSW", domprice$VESSHOLD)
+domprice$VESSHOLD <- ifelse((domprice$PERMIT==410403 & domprice$YEAR <= 2016), "FT", domprice$VESSHOLD)
+domprice$VESSHOLD <- ifelse((domprice$PERMIT==410403 & domprice$YEAR > 2016), "RSW", domprice$VESSHOLD)
+
+domprice$FLEET <- ifelse(domprice$VESSHOLD=="FT", yes = "FREEZE", no = "WET")  
+
+domprice %>% filter(!(VESSHOLD %in% c("ICE", "FT", "RSW"))) %>% .$PERMIT %>% unique()
+  
+
+## summarize by week
+
+wkprice <- domprice %>%
+             group_by(FLEET, YEAR, WEEK) %>%
+             dplyr::summarize(WKPRICE = sum(DOLLARSADJ)/sum(POUNDS)) %>%
+             mutate(YRWEEK = paste0(YEAR, "-", WEEK),
+                    lagWEEK = (WEEK + 1),
+                    lagYRWEEK = paste0(YEAR, "-", lagWEEK)) #%>%
+  #pivot_wider(id_cols = YRWEEK, names_from = FLEET, values_from = WKPRICE)
+
+## plot the price trends                      
+ggplot(wkprice) + geom_line(aes(x = YRWEEK, y = WKPRICE, group = FLEET, color = FLEET))
+#........hmm, there are some questionable values
+
+wkprice %>% filter(FLEET == "FREEZE") %>% .$WKPRICE %>% summary()
+wkprice %>% filter(FLEET == "WET") %>% .$WKPRICE %>% summary()
+
+
+rm(doladjust, domprice)
+
+```
+
+## Global Production
+* Global production was consistently reported as a major factor affecting LPUE. The mechanism is unclear but is likely more related to price and demand than to biological productivity because the various squid species and fisheries that comprise the global market are quite different in terms of oceanography, scale of fishing operations, etc.
+* Annual global landings of Argentine shortfin squid (*Illex argentinus*) and Japanese flying squid (*Todarodes pacificus*) are included as indicators of the global ommastrephid squid market. The data were pulled from the [FAO landings database](http://www.fao.org/fishery/statistics/global-capture-production/en) on 2021/09/22.
++ The *I. argentinus* fishery is primarily in the first half of the year (before our squid fishery), so the same year as our fishing year is used.
++ The *T. pacificus* fishery is primarily in the second half of the year. So the *T. pacificus* landings should be lagged one year.
++ **The derived column "OMMA_LANDNGS" is the sum of *I. argentinus* in year i and *T. pacificus* in year (i-1)**
+
+```{r global production}
+globalprod <- read_excel("FAO_1997-2019CaptureProduction_IllexArg_TodPac.xlsx", 
+                                 sheet = "FAO_TP_IA_Production",
+                                 skip = 1,
+                                 trim_ws = TRUE,
+                                 col_names = c("YEAR", "I_ARGENTINUS", "T_PACIFICUS", "UNIT")) %>%
+                  mutate(OMMA_LANDINGS = NA)
+
+for(i in 2:nrow(globalprod)) {
+  globalprod$OMMA_LANDINGS[i] <- round((globalprod$I_ARGENTINUS[i] + globalprod$T_PACIFICUS[i-1]),0)
+}
+
+globalprod
+
+rm(i)
+```
+
+## Landing Port
+* List of port codes with names was pulled from Oracle. 
+* Shapefile of major ports was providede by Ben Galuardi.
+
+```{r ports}
+
+ports <- read_csv("ports_list.csv") 
+ports <- ports %>% 
+  pivot_longer(1:2, names_to = c("NAMETYPE"), values_to = "PORTNAME", ) %>%
+  dplyr::select(-c("NAMETYPE")) %>%
+  unique() %>%
+  mutate(PORTCITYSTATE = paste0(PORTNAME, ", ", STATEABB),
+         PORT = as.character(PORT))
+  
+portlocation <- read_csv("portlocations.csv") %>% 
+             mutate(PORTCITYSTATE = str_to_upper(PORTCITYSTATE)) %>% 
+             left_join(ports)
+
+rm(ports)
+
+```
+
+## Distance to fishing ground
+* Distance to fishing ground needs to be calculated for each **trip**. No additional data to read in. 
+
+## Trip Duration
+* Trip duration (aka days absent) is recorded in the databases of catch and trip information. No additional data to read in.
+
+## Northeast US Fuel Prices
+* Fuel price is reported to impact fishing behavior in a similar way to the domestic Illex squid price. When fuel is more expensive, fishers are less willing to search/move off a moderately productive spot.
+* Diesel price for New England was pulled from the [Energy Information Administration](https://www.eia.gov/dnav/pet/pet_pri_gnd_dcus_r1x_w.htm) on 2021/10/20.
+* Prices are adjusted for inflation by standardizing to 2019 USD using the Gross Domestic Product Implicit Pride Deflator from [Federal Reserve Economic Data](https://fred.stlouisfed.org).
+
+```{r fuel price}
+fuel <- read_excel("WeeklyDieselPrice_download.xls",
+                   sheet = "Data 1",
+                                 skip = 3,
+                                 trim_ws = TRUE,
+                                 col_names = c("DATE", "DIESEL")) %>%
+                  mutate(WEEK = isoweek(DATE),
+                         YEAR = year(DATE))
+doladjust <- read_excel("Copy of DolAdj.xlsx",
+                        sheet = "factor - 2019 dollars",
+                        skip = 11,
+                        trim_ws = TRUE,
+                        # range = c("A11:A51", "F11:F51"),
+                        col_names = c("YEAR", 
+                                      "GDPDEF", 
+                                      "BLANK1", "BLANK2", "BLANK3",
+                                      "ADJUSTMENT", 
+                                      "NOTES")) %>%
+               dplyr::select("YEAR", "ADJUSTMENT") %>%
+               mutate("YEAR" = substr(YEAR, start = 1, stop = 4) %>% as.numeric())
+
+fuel <- left_join(fuel, doladjust, by = "YEAR") %>%
+         mutate("DIESELADJ" = DIESEL*ADJUSTMENT) %>%
+         dplyr::select("WEEK",
+                       "YEAR",
+                       "DIESELADJ")
+
+rm(doladjust)
+
+```
